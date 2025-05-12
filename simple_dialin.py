@@ -15,7 +15,7 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame
+from pipecat.frames.frames import EndTaskFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -166,6 +166,44 @@ async def main(
     async def on_participant_left(transport, participant, reason):
         logger.debug(f"Participant left: {participant}, reason: {reason}")
         await task.cancel()
+
+    # ------------ SILENCE DETECTION ------------
+
+    async def silence_watcher():
+        silence_duration = 10
+        last_speech_time = asyncio.get_event_loop().time()
+        unanswered_count = 0
+
+        async def on_speech_detected(*_):
+            nonlocal last_speech_time
+            last_speech_time = asyncio.get_event_loop().time()
+            unanswered_count = 0
+
+        # Register callback for VAD speech events
+        vad = transport_params.vad_analyzer
+        if hasattr(vad, "on_speech"):
+            vad.on_speech(on_speech_detected)
+
+        while True:
+            await asyncio.sleep(1)
+            now = asyncio.get_event_loop().time()
+            if now - last_speech_time > silence_duration:
+                logger.info(f"Silence strike {unanswered_count+1}/3.")
+                prompt = TextFrame("Are you still there?")
+                await task.queue_frames([prompt])
+                unanswered_count += 1
+                last_speech_time = now
+
+                if unanswered_count >= 3:
+                    await asyncio.sleep(silence_duration)
+                    session_manager.call_flow_state.set_call_terminated()
+                    await llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+                    return
+
+
+
+    # Start silence watcher in the background
+    asyncio.create_task(silence_watcher())
 
     # ------------ RUN PIPELINE ------------
 

@@ -43,6 +43,8 @@ class SilenceDetector(FrameProcessor):
         self.last_speech_time = asyncio.get_event_loop().time()
         self.unanswered_count = 0
         self._last_transcription = None
+        self.speech_events = 0
+        self.silence_events = 0
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -53,6 +55,7 @@ class SilenceDetector(FrameProcessor):
             self.last_speech_time = asyncio.get_event_loop().time()
             self.unanswered_count = 0
             self._last_transcription = None
+            self.speech_events += 1
 
         # On transcription, drop exact duplicates
         if isinstance(frame, TranscriptionFrame):
@@ -209,12 +212,13 @@ async def main(
             await asyncio.sleep(1)
             now = asyncio.get_event_loop().time()
 
-            # If silent more thant the threshold, send a prompt
+            # If silent more than the threshold, send a prompt
             if now - silence_detector.last_speech_time > silence_duration:
                 if silence_detector.unanswered_count < 3:
                     logger.info(f"Silence strike {silence_detector.unanswered_count+1}/3.")
                     await task.queue_frames([TextFrame("Are you still there?")])
                     silence_detector.unanswered_count += 1
+                    silence_detector.silence_events += 1
                     # bump the timer so we wait another silence_duration
                     silence_detector.last_speech_time = now
                 else:
@@ -235,8 +239,16 @@ async def main(
         logger.debug("Running in test mode (can be tested in Daily Prebuilt)")
 
     runner = PipelineRunner()
+    call_start = asyncio.get_event_loop().time()
     await runner.run(task)
+    call_end = asyncio.get_event_loop().time()
 
+    duration = call_end - call_start
+    logger.info(
+        f"Call summary: duration {duration:.1f}s · "
+        f"speech events {silence_detector.speech_events} · "
+        f"silence prompts {silence_detector.silence_events}"
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simple Dial-in Bot")

@@ -15,12 +15,12 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame, TextFrame
+from pipecat.frames.frames import EndTaskFrame, TextFrame, UserStartedSpeakingFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
@@ -33,6 +33,37 @@ logger.add(sys.stderr, level="DEBUG")
 
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
+
+
+
+class SilenceDetector(FrameProcessor):
+    """Tracks when the user last spoke and how many prompts have been sent."""
+    def __init__(self):
+        super().__init__()
+        self.last_speech_time = asyncio.get_event_loop().time()
+        self.unanswered_count = 0
+        self._last_transcription = None
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        # On start‐of‐speech, reset timer & counter, clear transcription cache
+        if isinstance(frame, UserStartedSpeakingFrame):
+            logger.info("USER IS SPEAKING — resetting silence timer")
+            self.last_speech_time = asyncio.get_event_loop().time()
+            self.unanswered_count = 0
+            self._last_transcription = None
+
+        # On transcription, drop exact duplicates
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip()
+            if text and text == self._last_transcription:
+                # swallow duplicate
+                return
+            self._last_transcription = text
+
+        # Forward every other frame down the pipeline
+        await self.push_frame(frame, direction)
 
 
 async def main(
@@ -137,12 +168,14 @@ async def main(
     context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
 
+    silence_detector = SilenceDetector()
     # ------------ PIPELINE SETUP ------------
 
     # Build pipeline
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
+            silence_detector,
             context_aggregator.user(),  # User responses
             llm,  # LLM
             tts,  # TTS
@@ -171,30 +204,21 @@ async def main(
 
     async def silence_watcher():
         silence_duration = 10
-        last_speech_time = asyncio.get_event_loop().time()
-        unanswered_count = 0
-
-        async def on_speech_detected(*_):
-            nonlocal last_speech_time
-            last_speech_time = asyncio.get_event_loop().time()
-            unanswered_count = 0
-
-        # Register callback for VAD speech events
-        vad = transport_params.vad_analyzer
-        if hasattr(vad, "on_speech"):
-            vad.on_speech(on_speech_detected)
 
         while True:
             await asyncio.sleep(1)
             now = asyncio.get_event_loop().time()
-            if now - last_speech_time > silence_duration:
-                logger.info(f"Silence strike {unanswered_count+1}/3.")
-                prompt = TextFrame("Are you still there?")
-                await task.queue_frames([prompt])
-                unanswered_count += 1
-                last_speech_time = now
 
-                if unanswered_count >= 3:
+            # If silent more thant the threshold, send a prompt
+            if now - silence_detector.last_speech_time > silence_duration:
+                if silence_detector.unanswered_count < 3:
+                    logger.info(f"Silence strike {silence_detector.unanswered_count+1}/3.")
+                    await task.queue_frames([TextFrame("Are you still there?")])
+                    silence_detector.unanswered_count += 1
+                    # bump the timer so we wait another silence_duration
+                    silence_detector.last_speech_time = now
+                else:
+                    logger.info("No response after 3 prompts. Terminating.")
                     await asyncio.sleep(silence_duration)
                     session_manager.call_flow_state.set_call_terminated()
                     await llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
